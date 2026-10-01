@@ -1,81 +1,268 @@
 import { configureStore, createSlice, type PayloadAction } from '@reduxjs/toolkit';
-import type { Protest, ProtestStatus, Race, RaceEntry, TimelineEvent } from './types';
 import { raceApi } from './api';
+import { projectRace, validateEvent } from './domain';
+import type { Boat, PendingOutboxEvent, Race, RaceResult, RegattaEvent } from './types';
 
 export interface AppState {
   races: Race[];
-  entries: RaceEntry[];
-  protests: Protest[];
-  timeline: TimelineEvent[];
+  boats: Boat[];
+  events: RegattaEvent[];
+  outbox: PendingOutboxEvent[];
+  terminalId: string;
+  online: boolean;
 }
 
-const initialEntries: RaceEntry[] = [
-  { id: 'entry-1', boat: '海风号', sailNo: 'CHN 218', skipper: '林舟', elapsedSeconds: 3168, penaltySeconds: 0, resultStatus: 'provisional', note: '' },
-  { id: 'entry-2', boat: '远岚号', sailNo: 'CHN 106', skipper: '周屿', elapsedSeconds: 3194, penaltySeconds: 30, resultStatus: 'provisional', note: '标记争议' },
-  { id: 'entry-3', boat: '北辰号', sailNo: 'CHN 077', skipper: '许澄', elapsedSeconds: 3210, penaltySeconds: 0, resultStatus: 'official', note: '' }
+const base = Date.parse('2026-10-01T09:00:00.000Z');
+const at = (seconds: number) => new Date(base + seconds * 1000).toISOString();
+
+const boats: Boat[] = [
+  { id: 'boat-1', boat: '海风号', sailNo: 'CHN 218', skipper: '林舟' },
+  { id: 'boat-2', boat: '远岚号', sailNo: 'CHN 106', skipper: '周屿' },
+  { id: 'boat-3', boat: '北辰号', sailNo: 'CHN 077', skipper: '许澄' },
+  { id: 'boat-4', boat: '白鸥号', sailNo: 'CHN 139', skipper: '沈砚' }
 ];
 
-const now = new Date();
-const initialStart = new Date(now.getTime() + 15 * 60 * 1000).toISOString();
+const races: Race[] = [
+  { id: 'race-1', name: '海湾长距离赛 · 第1场', fleet: '统一级', course: 'W2 / 东北风 12节', startsAt: at(0), order: 1, status: 'scheduled' },
+  { id: 'race-2', name: '海湾长距离赛 · 第2场', fleet: '统一级', course: 'W2 / 南风 10节', startsAt: at(3600), order: 2, status: 'scheduled' },
+  { id: 'race-3', name: '海湾长距离赛 · 第3场', fleet: '统一级', course: 'W3 / 东南风 14节', startsAt: at(7200), order: 3, status: 'scheduled' }
+];
 
-const initialState: AppState = {
-  races: [{ id: 'race-1', name: '海湾长距离赛 第1轮', fleet: '统一级', course: 'W2 / 东北风 12节', startsAt: initialStart, status: 'scheduled' }],
-  entries: initialEntries,
-  protests: [{ id: 'protest-1', raceId: 'race-1', entryId: 'entry-2', reason: '起航后发生舷侧接触', rule: 'RRS 14', status: 'reviewing', decision: '', createdAt: now.toISOString() }],
-  timeline: [
-    { id: 'event-1', time: now.toISOString(), type: 'race', message: '航线 W2 已发布' },
-    { id: 'event-2', time: new Date(now.getTime() + 2000).toISOString(), type: 'protest', message: '远岚号抗议进入复核' }
-  ]
+const initialEvents: RegattaEvent[] = [
+  {
+    id: 'event-seed-start-1',
+    seq: 1,
+    type: 'start',
+    raceId: 'race-1',
+    attempt: 1,
+    decision: 'black_flag',
+    boatIds: ['boat-3'],
+    penaltyId: 'penalty-seed-1',
+    occurredAt: at(0),
+    receivedAt: at(1),
+    terminalId: 'terminal-A'
+  },
+  {
+    id: 'event-seed-arrival-1',
+    seq: 2,
+    type: 'arrival',
+    raceId: 'race-1',
+    attempt: 1,
+    boatId: 'boat-1',
+    elapsedSeconds: 3168,
+    occurredAt: at(3168),
+    receivedAt: at(3171),
+    terminalId: 'terminal-B'
+  },
+  {
+    id: 'event-seed-arrival-2',
+    seq: 3,
+    type: 'arrival',
+    raceId: 'race-1',
+    attempt: 1,
+    boatId: 'boat-2',
+    elapsedSeconds: 3194,
+    occurredAt: at(3194),
+    receivedAt: at(3196),
+    terminalId: 'terminal-B'
+  },
+  {
+    id: 'event-seed-arrival-4',
+    seq: 4,
+    type: 'arrival',
+    raceId: 'race-1',
+    attempt: 1,
+    boatId: 'boat-4',
+    elapsedSeconds: 3218,
+    note: '一般召回演练船：未重新起航时该到达应作废',
+    occurredAt: at(3218),
+    receivedAt: at(3220),
+    terminalId: 'terminal-B'
+  },
+  {
+    id: 'event-seed-protest',
+    seq: 5,
+    type: 'protest',
+    protestId: 'protest-seed-1',
+    raceId: 'race-1',
+    boatId: 'boat-2',
+    rule: 'RRS 14',
+    reason: '起航后发生舷侧接触',
+    status: 'reviewing',
+    decision: '',
+    occurredAt: at(3300),
+    receivedAt: at(3301),
+    terminalId: 'terminal-A'
+  }
+];
+
+export const initialState: AppState = {
+  races,
+  boats,
+  events: initialEvents,
+  outbox: [],
+  terminalId: 'terminal-A',
+  online: true
 };
+
+const STORAGE_KEY = 'regatta-control-v2';
+function loadStoredState(): AppState {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) return initialState;
+  try {
+    const parsed = JSON.parse(raw) as Partial<AppState>;
+    if (!Array.isArray(parsed.races) || !Array.isArray(parsed.boats) || !Array.isArray(parsed.events)) return initialState;
+    return {
+      races: parsed.races,
+      boats: parsed.boats,
+      events: parsed.events,
+      outbox: Array.isArray(parsed.outbox) ? parsed.outbox : [],
+      terminalId: parsed.terminalId ?? initialState.terminalId,
+      online: parsed.online ?? true
+    };
+  } catch {
+    return initialState;
+  }
+}
+
+const preloadedState = loadStoredState();
+
+interface IngestResult {
+  accepted: boolean;
+  reason?: string;
+}
+
+function appendEvent(state: AppState, event: RegattaEvent): IngestResult {
+  const decision = validateEvent(state, event);
+  if (!decision.accepted) {
+    if (event.type !== 'system') {
+      state.events.push({
+        id: crypto.randomUUID(),
+        seq: state.events.reduce((max, item) => Math.max(max, item.seq ?? 0), 0) + 1,
+        type: 'system',
+        kind: 'conflict',
+        occurredAt: new Date().toISOString(),
+        receivedAt: new Date().toISOString(),
+        terminalId: state.terminalId,
+        message: decision.reason ?? '事件被拒绝',
+        rejectedEventId: event.id
+      });
+    }
+    return decision;
+  }
+
+  const nextSeq = state.events.reduce((max, item) => Math.max(max, item.seq ?? 0), 0) + 1;
+  state.events.push({ ...event, seq: nextSeq });
+  return { accepted: true };
+}
 
 const slice = createSlice({
   name: 'regatta',
-  initialState,
+  initialState: preloadedState,
   reducers: {
-    setRaceStatus(state, action: PayloadAction<{ id: string; status: Race['status'] }>) {
-      const race = state.races.find((item) => item.id === action.payload.id);
-      if (race) {
-        race.status = action.payload.status;
-        state.timeline.unshift({ id: crypto.randomUUID(), time: new Date().toISOString(), type: 'race', message: `${race.name} 状态更新为 ${race.status}` });
-      }
+    setTerminal(state, action: PayloadAction<string>) {
+      state.terminalId = action.payload;
     },
-    saveResult(state, action: PayloadAction<{ id: string; elapsedSeconds: number; penaltySeconds: number; note: string; official: boolean }>) {
-      const entry = state.entries.find((item) => item.id === action.payload.id);
-      if (!entry) return;
-      const changed = entry.elapsedSeconds !== action.payload.elapsedSeconds || entry.penaltySeconds !== action.payload.penaltySeconds;
-      entry.elapsedSeconds = action.payload.elapsedSeconds;
-      entry.penaltySeconds = action.payload.penaltySeconds;
-      entry.note = action.payload.note;
-      entry.resultStatus = action.payload.official ? 'official' : changed ? 'corrected' : 'provisional';
-      state.timeline.unshift({ id: crypto.randomUUID(), time: new Date().toISOString(), type: 'result', message: `${entry.boat} 成绩更正为 ${entry.elapsedSeconds + entry.penaltySeconds} 秒` });
+    setConnection(state, action: PayloadAction<boolean>) {
+      state.online = action.payload;
     },
-    addProtest(state, action: PayloadAction<{ raceId: string; entryId: string; reason: string; rule: string }>) {
-      const protest: Protest = { id: crypto.randomUUID(), ...action.payload, status: 'submitted', decision: '', createdAt: new Date().toISOString() };
-      state.protests.unshift(protest);
-      state.timeline.unshift({ id: crypto.randomUUID(), time: protest.createdAt, type: 'protest', message: `收到 ${action.payload.rule} 抗议，等待复核` });
+    receiveEvent(state, action: PayloadAction<RegattaEvent>) {
+      appendEvent(state, action.payload);
     },
-    transitionProtest(state, action: PayloadAction<{ id: string; status: ProtestStatus; decision?: string; penaltySeconds?: number }>) {
-      const protest = state.protests.find((item) => item.id === action.payload.id);
-      if (!protest) return;
-      protest.status = action.payload.status;
-      protest.decision = action.payload.decision ?? protest.decision;
-      if (action.payload.status === 'resolved' && action.payload.penaltySeconds) {
-        const entry = state.entries.find((item) => item.id === protest.entryId);
-        if (entry) {
-          entry.penaltySeconds = action.payload.penaltySeconds;
-          entry.resultStatus = 'corrected';
+    submitEvent(state, action: PayloadAction<RegattaEvent>) {
+      if (!state.online) {
+        if (!state.outbox.some((item) => item.event.id === action.payload.id)) {
+          state.outbox.push({ id: crypto.randomUUID(), queuedAt: new Date().toISOString(), event: action.payload });
         }
+        return;
       }
-      state.timeline.unshift({ id: crypto.randomUUID(), time: new Date().toISOString(), type: 'protest', message: `抗议 ${action.payload.id.slice(0, 6)} 更新为 ${action.payload.status}` });
+      appendEvent(state, action.payload);
+    },
+    flushOutbox(state) {
+      if (!state.online) return;
+      const queued = [...state.outbox].sort((a, b) =>
+        new Date(a.event.occurredAt).getTime() - new Date(b.event.occurredAt).getTime()
+        || a.queuedAt.localeCompare(b.queuedAt)
+      );
+      state.outbox = [];
+      for (const item of queued) {
+        appendEvent(state, { ...item.event, receivedAt: new Date().toISOString() });
+      }
+    },
+    cancelRace(state, action: PayloadAction<{ raceId: string; reason: string }>) {
+      const event: RegattaEvent = {
+        id: crypto.randomUUID(),
+        type: 'race-cancel',
+        raceId: action.payload.raceId,
+        reason: action.payload.reason,
+        occurredAt: new Date().toISOString(),
+        receivedAt: new Date().toISOString(),
+        terminalId: state.terminalId
+      };
+      appendEvent(state, event);
+    },
+    reverseStart(state, action: PayloadAction<{ raceId: string; startEventId: string; reason: string }>) {
+      const start = state.events.find((event) => event.id === action.payload.startEventId && event.type === 'start');
+      if (!start || start.type !== 'start') return;
+      const event: RegattaEvent = {
+        id: crypto.randomUUID(),
+        type: 'start-reversal',
+        raceId: action.payload.raceId,
+        attempt: start.attempt,
+        startEventId: start.id,
+        reason: action.payload.reason,
+        occurredAt: new Date().toISOString(),
+        receivedAt: new Date().toISOString(),
+        terminalId: state.terminalId
+      };
+      appendEvent(state, event);
+    },
+    reversePenalty(state, action: PayloadAction<{ penaltyId: string; reason: string }>) {
+      const event: RegattaEvent = {
+        id: crypto.randomUUID(),
+        type: 'judge-reversal',
+        penaltyId: action.payload.penaltyId,
+        reason: action.payload.reason,
+        occurredAt: new Date().toISOString(),
+        receivedAt: new Date().toISOString(),
+        terminalId: state.terminalId
+      };
+      appendEvent(state, event);
+    },
+    publishRace(state, action: PayloadAction<{ raceId: string }>) {
+      const race = state.races.find((item) => item.id === action.payload.raceId);
+      if (!race) return;
+      const projection = projectRace(state, race);
+      const event: RegattaEvent = {
+        id: crypto.randomUUID(),
+        type: 'publish',
+        raceId: race.id,
+        version: projection.currentVersion,
+        results: projection.results.map((result): RaceResult => result),
+        occurredAt: new Date().toISOString(),
+        receivedAt: new Date().toISOString(),
+        terminalId: state.terminalId
+      };
+      appendEvent(state, event);
+    },
+    resetDemo() {
+      return initialState;
     }
   }
 });
 
-const STORAGE_KEY = 'regatta-control-v1';
-const stored = localStorage.getItem(STORAGE_KEY);
-const preloadedState = stored ? JSON.parse(stored) as AppState : initialState;
-
-export const { setRaceStatus, saveResult, addProtest, transitionProtest } = slice.actions;
+export const {
+  setTerminal,
+  setConnection,
+  receiveEvent,
+  submitEvent,
+  flushOutbox,
+  cancelRace,
+  reverseStart,
+  reversePenalty,
+  publishRace,
+  resetDemo
+} = slice.actions;
 
 export const store = configureStore({
   reducer: { regatta: slice.reducer, [raceApi.reducerPath]: raceApi.reducer },
